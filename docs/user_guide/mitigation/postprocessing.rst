@@ -427,6 +427,49 @@ argue that this constitutes
 under US anti-discrimination law or direct discrimination under
 EU non-discrimination law in contexts covered by these laws.
 
+Using sample weights
+~~~~~~~~~~~~~~~~~~~~
+
+:class:`ThresholdOptimizer` accepts a :code:`sample_weight` argument in
+:code:`fit()`. The weights are not just forwarded to the base estimator: they
+are used throughout the threshold optimization, so that the fitted thresholds,
+the group proportions, the trade-off curves and the objective all reflect the
+weighted data. This makes it possible to work with data where each row
+represents several people, e.g. because the data was aggregated by score and
+the row carries the number of people with that score.
+
+Concretely, a sample with weight :math:`w` contributes :math:`w` to the
+confusion matrix counts of its group, a sensitive feature value's proportion
+among all samples is its share of the total weight, and the overall objective
+is the weighted average of the per-group objectives. This is equivalent to
+replicating every sample :math:`w` times (for integer weights) in the
+unweighted formulation. The randomized predictions returned by :code:`predict`
+therefore have the same expected behaviour as if the weighted data had been
+replicated.
+
+Some important consequences:
+
+* Samples with weight :code:`0` do not influence the fitted thresholds at all;
+  they can be thought of as not being part of the data.
+* Every sensitive feature value must have a positive total weight. A group
+  whose samples all have zero weight cannot be constrained, so it is rejected
+  with a :code:`ValueError`. Weights must also be non-negative and finite, and
+  there must be exactly one weight per sample.
+* If the base estimator supports a :code:`sample_weight` argument in its
+  :code:`fit()` method and :code:`prefit=False`, the weights are also passed
+  to it. Otherwise a warning is raised and the base estimator is fitted
+  without weights, while the threshold optimization still uses them.
+
+.. code-block:: python
+
+    threshold_optimizer = ThresholdOptimizer(
+        estimator=estimator,
+        constraints="demographic_parity")
+    threshold_optimizer.fit(
+        X_train, y_train,
+        sensitive_features=A_train,
+        sample_weight=weights_train)
+
 Using a pre-trained estimator
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 

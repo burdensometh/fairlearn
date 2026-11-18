@@ -9,6 +9,15 @@ v0.16.0
 New features
 ------------
 
+* :class:`~fairlearn.postprocessing.ThresholdOptimizer` accepts a
+  :code:`sample_weight` argument in :code:`fit`. The weights are applied to the
+  group proportions, the trade-off curves, the objective, and the interpolation
+  of the solution, so the fitted thresholds and the resulting randomized
+  predictions are consistent with the weighted data rather than merely weighting
+  the reported metrics. Zero-weight samples do not affect the solution, and
+  zero-weight groups as well as invalid weights are rejected. The weights are
+  also forwarded to the base estimator when it supports them.
+
 Bug fixes
 ---------
 

@@ -20,7 +20,7 @@ from sklearn import clone
 from sklearn.base import BaseEstimator, MetaEstimatorMixin
 from sklearn.exceptions import NotFittedError
 from sklearn.utils import Bunch
-from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.validation import check_is_fitted, has_fit_parameter
 
 from ..utils._common import _get_soft_predictions
 from ..utils._input_validation import _KW_CONTROL_FEATURES, _validate_and_reformat_input
@@ -29,6 +29,8 @@ from ._constants import (
     BASE_ESTIMATOR_NOT_FITTED_WARNING,
     LABEL_KEY,
     OUTPUT_SEPARATOR,
+    SAMPLE_WEIGHT_KEY,
+    SAMPLE_WEIGHT_NOT_SUPPORTED_WARNING,
     SCORE_KEY,
     SENSITIVE_FEATURE_KEY,
 )
@@ -57,6 +59,18 @@ SENSITIVE_FEATURE_NAMES_NOT_UNIQUE_ERROR_MESSAGE = (
 )
 SCORES_DATA_TOO_MANY_COLUMNS_ERROR_MESSAGE = "The provided scores data contains multiple columns."
 UNEXPECTED_DATA_TYPE_ERROR_MESSAGE = "Unexpected data type {} encountered."
+SAMPLE_WEIGHT_LENGTH_ERROR_MESSAGE = (
+    "sample_weight must have one entry per sample, i.e. the same length as y."
+)
+INVALID_SAMPLE_WEIGHT_ERROR_MESSAGE = (
+    "sample_weight must be a one-dimensional array of non-negative, finite numbers, "
+    "got invalid values {}."
+)
+ZERO_WEIGHT_GROUP_ERROR_MESSAGE = (
+    "The total sample weight of the sensitive feature values {} is zero. Every sensitive "
+    "feature value must have a positive total sample weight, otherwise the fairness "
+    "constraint cannot be enforced for that group."
+)
 
 logger = logging.getLogger(__name__)
 
@@ -270,7 +284,7 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
         self.predict_method = predict_method
         self.tol = tol
 
-    def fit(self, X, y, *, sensitive_features, **kwargs):
+    def fit(self, X, y, *, sensitive_features, sample_weight=None, **kwargs):
         """Fit the model.
 
         The fit is based on training features and labels, sensitive features,
@@ -285,13 +299,25 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
             The label vector. This must only contain binary labels (0 and 1).
         sensitive_features : numpy.ndarray, list, pandas.DataFrame, or pandas.Series
             sensitive features to identify groups by
+        sample_weight : numpy.ndarray, pandas.Series, or list, default=None
+            Individual sample weights. When provided, the thresholds, the
+            group proportions, and the objective are all computed on the
+            weighted data. Samples with a weight of zero do not influence the
+            fitted thresholds. Every sensitive feature group needs a positive
+            total weight. Weights must be non-negative and finite. If the base
+            estimator supports a :code:`sample_weight` argument and
+            :code:`prefit=False`, the weights are also forwarded to its
+            :code:`fit` method.
+
+            .. versionadded:: 0.16.0
 
         Raises
         ------
         ValueError
             If `estimator` is `None`, if `constraints` or `objective` is not
             supported, if `tol` is set together with ``constraints="equalized_odds"``,
-            or if `control_features` is passed in `kwargs`.
+            if `control_features` is passed in `kwargs`, or if `sample_weight`
+            is invalid.
         """
         if self.estimator is None:
             raise ValueError(BASE_ESTIMATOR_NONE_ERROR_MESSAGE)
@@ -324,6 +350,8 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
             enforce_binary_labels=True,
         )
 
+        sample_weight = _validate_sample_weight(sample_weight, expected_length=len(y))
+
         # postprocessing can't handle 0/1 as floating point numbers, so this
         # converts it to int
         if type(y) in [np.ndarray, pd.DataFrame, pd.Series]:
@@ -335,7 +363,18 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
             # Following is on two lines due to issue when estimator comes from
             # TensorFlow
             self.estimator_ = clone(self.estimator)
-            self.estimator_.fit(X, y, **kwargs)
+            if sample_weight is not None and has_fit_parameter(
+                self.estimator_, "sample_weight"
+            ):
+                self.estimator_.fit(X, y, sample_weight=sample_weight, **kwargs)
+            elif sample_weight is not None:
+                warn(
+                    SAMPLE_WEIGHT_NOT_SUPPORTED_WARNING.format(type(self.estimator_).__name__),
+                    stacklevel=2,
+                )
+                self.estimator_.fit(X, y, **kwargs)
+            else:
+                self.estimator_.fit(X, y, **kwargs)
         else:
             try:
                 check_is_fitted(self.estimator)
@@ -354,7 +393,7 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
             threshold_optimization_method = self._threshold_optimization_for_simple_constraints
 
         self.interpolated_thresholder_ = threshold_optimization_method(
-            sensitive_feature_vector, y, scores
+            sensitive_feature_vector, y, scores, sample_weight
         )
         return self
 
@@ -406,7 +445,7 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
         )
 
     def _threshold_optimization_for_simple_constraints(
-        self, sensitive_features, labels, scores
+        self, sensitive_features, labels, scores, sample_weight=None
     ) -> InterpolatedThresholder:
         """Calculate the objective value across all values of constraints.
 
@@ -416,6 +455,9 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
         selected solution, which is recreated by interpolating between two points on the convex
         hull of all solutions. Each sensitive feature value has its own predictor in the resulting
         postprocessed predictor, which requires the sensitive feature value as an input.
+
+        When `sample_weight` is provided, all the frequencies, metric values, and the
+        objective are computed on the weighted data.
 
         This method assumes that sensitive_features, labels, and scores are non-empty data
         structures of equal length, and labels contains only binary labels 0 and 1.
@@ -428,26 +470,30 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
             the labels of the dataset
         scores : list, numpy.ndarray, pandas.DataFrame, or pandas.Series
             the scores produced by a predictor's prediction
+        sample_weight : list, numpy.ndarray, pandas.Series, or None
+            the sample weights; `None` means every sample has weight 1
 
         Returns
         -------
         InterpolatedThresholder
             the postprocessed predictor.
         """
-        n = len(labels)
         self._tradeoff_curve = {}
         self._x_grid = np.linspace(0, 1, self.grid_size + 1)
         overall_tradeoff_curve = 0 * self._x_grid
 
         data_grouped_by_sensitive_feature = _reformat_and_group_data(
-            sensitive_features, labels, scores
+            sensitive_features, labels, scores, sample_weight=sample_weight
         )
 
+        _validate_group_weights(data_grouped_by_sensitive_feature, sample_weight is not None)
         sensitive_feature_proportions = {}
+        total_weight = _get_total_weight(sample_weight, len(labels))
 
         for sensitive_feature_value, group in data_grouped_by_sensitive_feature:
             # Determine probability of current sensitive feature group based on data.
-            p_sensitive_feature_value = len(group) / n
+            group_weight = _get_group_weight(group, sample_weight is not None)
+            p_sensitive_feature_value = group_weight / total_weight
             sensitive_feature_proportions[sensitive_feature_value] = p_sensitive_feature_value
 
             metrics_curve_convex_hull = _tradeoff_curve(
@@ -542,11 +588,16 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
             predict_method=self._predict_method,
         ).fit(None, None)
 
-    def _threshold_optimization_for_equalized_odds(self, sensitive_features, labels, scores):
+    def _threshold_optimization_for_equalized_odds(
+        self, sensitive_features, labels, scores, sample_weight=None
+    ):
         """Calculate the ROC curve of every sensitive feature value at different thresholds.
 
         Subsequently takes the overlapping region of the ROC curves, and finds the best
         solution by selecting the point on the curve with maximum objective value.
+
+        When `sample_weight` is provided, the ROC curves and the objective are computed
+        on the weighted data.
 
         This method assumes that sensitive_features, labels, and scores are non-empty data
         structures of equal length, and labels contains only binary labels 0 and 1.
@@ -559,6 +610,8 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
             the labels of the dataset
         scores : list, numpy.ndarray, pandas.DataFrame, or pandas.Series
             the scores produced by a predictor's prediction
+        sample_weight : list, numpy.ndarray, pandas.Series, or None
+            the sample weights; `None` means every sample has weight 1
 
         Returns
         -------
@@ -566,13 +619,11 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
             the postprocessed predictor.
         """
         data_grouped_by_sensitive_feature = _reformat_and_group_data(
-            sensitive_features, labels, scores
+            sensitive_features, labels, scores, sample_weight=sample_weight
         )
 
-        n = len(labels)
-
-        n_positive = labels.sum().loc[0] if isinstance(labels, pd.DataFrame) else sum(labels)
-        n_negative = n - n_positive
+        _, n_positive, n_negative = _get_weighted_label_counts(labels, sample_weight)
+        _validate_group_weights(data_grouped_by_sensitive_feature, sample_weight is not None)
         self._tradeoff_curve = {}
         self._x_grid = np.linspace(0, 1, self.grid_size + 1)
         y_values = pd.DataFrame()
@@ -667,7 +718,9 @@ class ThresholdOptimizer(MetaEstimatorMixin, BaseEstimator):
         ).fit(None, None)
 
 
-def _reformat_and_group_data(sensitive_features, labels, scores, sensitive_feature_names=None):
+def _reformat_and_group_data(
+    sensitive_features, labels, scores, sensitive_feature_names=None, sample_weight=None
+):
     """Reformats the data into a new pandas.DataFrame and group by sensitive feature values.
 
     The data are provided as three arguments (`sensitive_features`, `labels`, `scores`) and
@@ -686,6 +739,8 @@ def _reformat_and_group_data(sensitive_features, labels, scores, sensitive_featu
         list of names for the sensitive features in case they were not
         implicitly provided (e.g. if `sensitive_features` is of type
         pandas.DataFrame); default None
+    sample_weight : list, numpy.ndarray, pandas.Series, or None
+        the sample weights; if `None` no weights are stored in the output
 
     Returns
     -------
@@ -703,6 +758,8 @@ def _reformat_and_group_data(sensitive_features, labels, scores, sensitive_featu
     )
     _reformat_data_into_dict(SCORE_KEY, data_dict, scores)
     _reformat_data_into_dict(LABEL_KEY, data_dict, labels)
+    if sample_weight is not None:
+        _reformat_data_into_dict(SAMPLE_WEIGHT_KEY, data_dict, sample_weight)
 
     data = pd.DataFrame(data_dict)
     sensitive_feature_columns = [
@@ -711,6 +768,87 @@ def _reformat_and_group_data(sensitive_features, labels, scores, sensitive_featu
     if len(sensitive_feature_columns) == 1:
         return data.groupby(sensitive_feature_columns[0])
     return data.groupby(sensitive_feature_columns)
+
+
+def _validate_sample_weight(sample_weight, expected_length):
+    """Validate the sample weights and return them as a one-dimensional numpy array.
+
+    Parameters
+    ----------
+    sample_weight : array-like or None
+        The sample weights provided by the user.
+    expected_length : int
+        The number of samples the weights have to be provided for.
+
+    Returns
+    -------
+    numpy.ndarray or None
+        The validated sample weights or `None` if none were provided.
+    """
+    if sample_weight is None:
+        return None
+
+    try:
+        weights = np.asarray(sample_weight, dtype=float)
+    except (TypeError, ValueError):
+        raise ValueError(
+            INVALID_SAMPLE_WEIGHT_ERROR_MESSAGE.format(f"type {type(sample_weight).__name__}")
+        ) from None
+    if weights.ndim == 2 and weights.shape[1] == 1:
+        weights = weights.reshape(-1)
+    if weights.ndim != 1:
+        raise ValueError(INVALID_SAMPLE_WEIGHT_ERROR_MESSAGE.format(f"shape {weights.shape}"))
+    if len(weights) != expected_length:
+        raise ValueError(SAMPLE_WEIGHT_LENGTH_ERROR_MESSAGE)
+    invalid = ~np.isfinite(weights) | (weights < 0)
+    if invalid.any():
+        raise ValueError(INVALID_SAMPLE_WEIGHT_ERROR_MESSAGE.format(weights[invalid]))
+
+    return weights
+
+
+def _get_group_weight(group, weighted):
+    """Return the total weight (or the length) of a group."""
+    if weighted:
+        return float(group[SAMPLE_WEIGHT_KEY].sum())
+    return len(group)
+
+
+def _get_total_weight(sample_weight, n_samples):
+    """Return the total weight (or the number of samples) of the data."""
+    if sample_weight is None:
+        return n_samples
+    return float(np.asarray(sample_weight, dtype=float).sum())
+
+
+def _get_weighted_label_counts(labels, sample_weight):
+    """Return the total, positive, and negative weight (or counts) of the labels."""
+    labels_array = np.asarray(labels).reshape(-1).astype(int)
+    if sample_weight is None:
+        weights = np.ones_like(labels_array, dtype=float)
+    else:
+        weights = np.asarray(sample_weight, dtype=float).reshape(-1)
+    n = weights.sum()
+    n_positive = weights[labels_array == 1].sum()
+    n_negative = n - n_positive
+    return n, n_positive, n_negative
+
+
+def _validate_group_weights(grouped_data, weighted):
+    """Raise if a sensitive feature value has a zero total weight.
+
+    Such a group cannot be represented in the optimization: its proportion is
+    zero and its constraint metric is undefined.
+    """
+    if not weighted:
+        return
+    zero_weight_groups = [
+        sensitive_feature_value
+        for sensitive_feature_value, group in grouped_data
+        if float(group[SAMPLE_WEIGHT_KEY].sum()) <= 0
+    ]
+    if zero_weight_groups:
+        raise ValueError(ZERO_WEIGHT_GROUP_ERROR_MESSAGE.format(zero_weight_groups))
 
 
 def _reformat_data_into_dict(

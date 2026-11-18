@@ -9,7 +9,7 @@ from narwhals.typing import IntoDataFrame, IntoDataFrameT
 from numpy.typing import NDArray
 from sklearn.utils import Bunch
 
-from ._constants import LABEL_KEY, SCORE_KEY
+from ._constants import LABEL_KEY, SAMPLE_WEIGHT_KEY, SCORE_KEY
 from ._threshold_operation import ThresholdOperation
 
 DEGENERATE_LABELS_ERROR_MESSAGE = "Degenerate labels for sensitive feature value {}"
@@ -90,7 +90,9 @@ def _tradeoff_curve(
     Parameters
     ----------
     data : :class:`pandas:pandas.DataFrame`, :class:`polars:polars.DataFrame` or :class:`pyarrow:pyarrow.Table`
-        Data frame with columns 'score' and 'label'.
+        Data frame with columns 'score' and 'label'. If it contains a
+        'sample_weight' column, the metrics are computed on the weighted data and
+        samples with zero weight are ignored.
 
     sensitive_feature_value : str or int
         The sensitive feature value of the samples providing in `data`. Only used
@@ -293,7 +295,9 @@ def _calculate_tradeoff_points(
     Parameters
     ----------
     data : :class:`pandas:pandas.DataFrame`, :class:`polars:polars.DataFrame` or :class:`pyarrow:pyarrow.Table`
-        The DataFrame containing scores and labels.
+        The DataFrame containing scores and labels. If it contains a
+        'sample_weight' column, the counts are weighted accordingly and samples
+        with zero weight are ignored.
     sensitive_feature_value : str, int
         The sensitive feature value of the samples provided in `data`.
     flip : bool, default=False
@@ -313,13 +317,14 @@ def _calculate_tradeoff_points(
     result : :class:`pandas:pandas.DataFrame`, :class:`polars:polars.DataFrame` or :class:`pyarrow:pyarrow.Table`
         The ROC curve points with their corresponding threshold operations.
     """
-    scores, labels, n, n_positive, n_negative = _get_scores_labels_and_counts(data)
+    scores, labels, weights, n, n_positive, n_negative = _get_scores_labels_and_counts(data)
 
     if n_positive == 0 or n_negative == 0:
         raise ValueError(DEGENERATE_LABELS_ERROR_MESSAGE.format(sensitive_feature_value))
 
     scores.append(-np.inf)
     labels.append(np.nan)
+    weights.append(0.0)
 
     # Iterate through all samples which are sorted by decreasing scores.
     # Setting the threshold between two scores means that everything smaller
@@ -327,7 +332,7 @@ def _calculate_tradeoff_points(
     # threshold gets a label of 1. Flipping labels is an option if flipping
     # labels provides better accuracy.
     i = 0
-    count = [0, 0]
+    count = [0.0, 0.0]
     x_list, y_list, operation_list = [], [], []
 
     x_metric_fn = METRIC_DICT[x_metric]
@@ -340,7 +345,7 @@ def _calculate_tradeoff_points(
         else:
             threshold = scores[i]
             while scores[i] == threshold:
-                count[labels[i]] += 1
+                count[int(labels[i])] += weights[i]
                 i += 1
             threshold = (threshold + scores[i]) / 2
 
@@ -375,10 +380,16 @@ def _calculate_tradeoff_points(
     ).to_native()
 
 
-def _get_scores_labels_and_counts(data: IntoDataFrame) -> tuple[list, list, int, int, int]:
-    """Order samples by scores, counting number of positive, negative, and overall samples.
+def _get_scores_labels_and_counts(
+    data: IntoDataFrame,
+) -> tuple[list, list, list, float, float, float]:
+    """Order samples by scores, counting weighted positive, negative, and overall samples.
 
-    The samples are sorted into descending order.
+    The samples are sorted into descending order. If the data frame contains a
+    'sample_weight' column then the counts are sums of the corresponding sample
+    weights, otherwise each sample counts as one. Samples with zero weight do
+    not contribute to any count, i.e. they are indistinguishable from samples
+    that are not present at all.
 
     Parameters
     ----------
@@ -387,36 +398,55 @@ def _get_scores_labels_and_counts(data: IntoDataFrame) -> tuple[list, list, int,
 
     Returns
     -------
-    result : tuple[list, list, int, int, int]
-        A tuple containing the sorted scores, labels, the number of samples, \
-        the number of positive samples, and the number of negative samples.
+    result : tuple[list, list, list, float, float, float]
+        A tuple containing the sorted scores, sorted labels, sorted sample weights, \
+        the (weighted) number of samples, the (weighted) number of positive samples, \
+        and the (weighted) number of negative samples.
     """
-    data_sorted = nw.from_native(data, eager_only=True, pass_through=False).sort(
-        by=SCORE_KEY, descending=True
-    )
+    nw_data = nw.from_native(data, eager_only=True, pass_through=False)
+    if SAMPLE_WEIGHT_KEY in nw_data.columns:
+        nw_data = nw_data.filter(nw.col(SAMPLE_WEIGHT_KEY) > 0)
+    data_sorted = nw_data.sort(by=SCORE_KEY, descending=True)
 
     scores = data_sorted.get_column(SCORE_KEY)
     labels = data_sorted.get_column(LABEL_KEY)
+    if SAMPLE_WEIGHT_KEY in data_sorted.columns:
+        weights = data_sorted.get_column(SAMPLE_WEIGHT_KEY)
+    else:
+        weights = None
 
-    n, n_positive, n_negative = _get_counts(labels)
+    n, n_positive, n_negative = _get_counts(labels, weights)
 
-    return scores.to_list(), labels.to_list(), n, n_positive, n_negative
+    weights_list = weights.to_list() if weights is not None else [1.0] * n
+
+    return scores.to_list(), labels.to_list(), weights_list, n, n_positive, n_negative
 
 
-def _get_counts(labels: nw.Series) -> tuple[int, int, int]:
-    """Return the overall, positive, and negative counts of the labels.
+def _get_counts(
+    labels: nw.Series, weights: nw.Series | None = None
+) -> tuple[int, float, float]:
+    """Return the number of samples and the weighted positive and negative counts.
 
     Parameters
     ----------
-    labels : list
+    labels : nw.Series
         The labels of the samples.
+    weights : nw.Series, optional
+        The sample weights. If `None`, every sample counts as one.
 
     Returns
     -------
-    result : tuple[int, int, int]
-        A tuple containing the overall, positive, and negative counts of the labels.
+    result : tuple[int, float, float]
+        A tuple containing the number of samples, the weighted number of \
+        positive samples, and the weighted number of negative samples.
     """
     n = len(labels)
-    n_positive = labels.sum()
-    n_negative = n - n_positive
+    labels_array = labels.to_numpy()
+    if weights is None:
+        n_positive = labels_array.sum()
+        n_negative = n - n_positive
+    else:
+        weights_array = weights.to_numpy()
+        n_positive = weights_array[labels_array == 1].sum()
+        n_negative = weights_array[labels_array == 0].sum()
     return n, n_positive, n_negative

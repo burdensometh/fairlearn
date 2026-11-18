@@ -4,6 +4,7 @@
 SCORE_KEY = "score"
 LABEL_KEY = "label"
 SENSITIVE_FEATURE_KEY = "sensitive_feature"
+SAMPLE_WEIGHT_KEY = "sample_weight"
 
 OUTPUT_SEPARATOR = "-" * 65
 
@@ -23,4 +24,9 @@ BASE_ESTIMATOR_NOT_FITTED_WARNING = (
     " `sklearn.model_selection.cross_validate`).\n\nIn case (1), please file an issue"
     " with the base estimator developers, but continue to use the enclosing {0} with"
     " `prefit=True`. In case (2), please use `prefit=False`."
+)
+SAMPLE_WEIGHT_NOT_SUPPORTED_WARNING = (
+    "The base estimator {0} does not accept a `sample_weight` argument in its `fit` "
+    "method. The provided `sample_weight` is used for the threshold optimization, but "
+    "the base estimator is fitted without weights."
 )
